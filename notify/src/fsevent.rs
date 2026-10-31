@@ -21,9 +21,10 @@ use crate::{
 use fsevent_sys as fs;
 use fsevent_sys::core_foundation as cf;
 use std::collections::HashMap;
-use std::ffi::CStr;
+use std::ffi::{CStr, OsStr};
 use std::fmt;
 use std::os::raw;
+use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::ptr;
 use std::sync::{Arc, Mutex};
@@ -511,7 +512,9 @@ extern "C" fn callback(
     event_flags: *const fs::FSEventStreamEventFlags, // const FSEventStreamEventFlags eventFlags[]
     event_ids: *const fs::FSEventStreamEventId,      // const FSEventStreamEventId eventIds[]
 ) {
-    unsafe {
+    // Unwinding out of an `extern "C"` function aborts the process, so a
+    // panic in the handler or here ends this batch of events instead.
+    let delivered = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
         callback_impl(
             stream_ref,
             info,
@@ -520,6 +523,9 @@ extern "C" fn callback(
             event_flags,
             event_ids,
         )
+    }));
+    if delivered.is_err() {
+        log::error!("FSEvent callback panicked; its batch of events was dropped");
     }
 }
 
@@ -536,15 +542,13 @@ unsafe fn callback_impl(
     let event_handler = &(*info).event_handler;
 
     for p in 0..num_events {
-        let path = CStr::from_ptr(*event_paths.add(p))
-            .to_str()
-            .expect("Invalid UTF8 string.");
-        let path = PathBuf::from(path);
+        // A path is bytes, not necessarily UTF-8.
+        let path = CStr::from_ptr(*event_paths.add(p));
+        let path = PathBuf::from(OsStr::from_bytes(path.to_bytes()));
 
-        let flag = *event_flags.add(p);
-        let flag = StreamFlags::from_bits(flag).unwrap_or_else(|| {
-            panic!("Unable to decode StreamFlags: {}", flag);
-        });
+        // A flag bit this crate doesn't know (a newer macOS's) is dropped, not
+        // a panic: the bits it knows still say what happened.
+        let flag = StreamFlags::from_bits_truncate(*event_flags.add(p));
 
         let mut handle_event = false;
         for (p, r) in &(*info).recursive_info {
@@ -648,4 +652,44 @@ fn test_fsevent_watcher_drop() {
 fn test_steam_context_info_send_and_sync() {
     fn check_send<T: Send + Sync>() {}
     check_send::<StreamContextInfo>();
+}
+
+/// A path that is not UTF-8 and a flag bit this crate doesn't know reach the
+/// handler as an event, not a panic in the `extern "C"` callback.
+#[test]
+fn callback_delivers_a_non_utf8_path_with_an_unknown_flag_bit() {
+    use std::ffi::CString;
+
+    let (tx, rx) = std::sync::mpsc::channel::<Result<Event>>();
+    let root = PathBuf::from("/watched");
+    let info = StreamContextInfo {
+        event_handler: Arc::new(Mutex::new(tx)),
+        recursive_info: HashMap::from([(root.clone(), true)]),
+    };
+    let path = CString::new(b"/watched/caf\xe9".to_vec()).unwrap();
+    let mut paths = [path.as_ptr()];
+    let unknown_bit = 1 << 31;
+    let flags = [StreamFlags::ITEM_CREATED.bits() | StreamFlags::IS_FILE.bits() | unknown_bit];
+    let ids = [0];
+    assert!(StreamFlags::from_bits(flags[0]).is_none());
+
+    unsafe {
+        callback_impl(
+            ptr::null_mut(),
+            &info as *const StreamContextInfo as *mut libc::c_void,
+            1,
+            paths.as_mut_ptr() as *mut libc::c_void,
+            flags.as_ptr(),
+            ids.as_ptr(),
+        );
+    }
+
+    let event = rx
+        .try_recv()
+        .expect("the event reached the handler")
+        .unwrap();
+    assert_eq!(
+        event.paths,
+        vec![PathBuf::from(OsStr::from_bytes(b"/watched/caf\xe9"))]
+    );
 }
